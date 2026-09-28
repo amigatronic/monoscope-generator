@@ -1,0 +1,3 @@
+# Only needed for the optional tools; svg_to_json.py and svg_geometry_core.py use the standard library only.
+reportlab   # json_to_pdf.py
+Pillow      # render_reference.py

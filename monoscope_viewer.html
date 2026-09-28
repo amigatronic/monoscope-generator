@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Monoscope JSON Viewer</title>
+<style>
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#222;font-family:Arial,sans-serif}
+#toolbar{height:42px;box-sizing:border-box;background:#292929;color:#fff;display:flex;align-items:center;gap:8px;padding:6px 10px}
+button,input[type=file]{font:14px Arial}
+button{padding:3px 9px}
+#fileName{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#status{white-space:nowrap}
+#viewport{position:absolute;left:0;right:0;top:42px;bottom:0;background:#fff}
+svg{display:block;width:100%;height:100%;background:#fff;user-select:none}
+</style>
+</head>
+<body>
+<div id="toolbar">
+<button id="fit">Fit</button>
+<button id="one">100%</button>
+<input id="fileInput" type="file" accept=".json,application/json">
+<span id="fileName">Loading Philips_PM5544.json...</span>
+<span id="status"></span>
+</div>
+<div id="viewport"><svg id="svg" xmlns="http://www.w3.org/2000/svg"></svg></div>
+<script>
+const NS="http://www.w3.org/2000/svg";
+const svg=document.getElementById("svg");
+const fileInput=document.getElementById("fileInput");
+const fileName=document.getElementById("fileName");
+const status=document.getElementById("status");
+let doc=null, bounds=null;
+let baseView=null, view=null, dragging=false, lastX=0,lastY=0;
+
+function el(name,attrs={}){const n=document.createElementNS(NS,name);for(const [k,v] of Object.entries(attrs))if(v!==undefined&&v!==null)n.setAttribute(k,String(v));return n;}
+function escId(s){return String(s).replace(/[^A-Za-z0-9_-]/g,"_");}
+function pathData(shape){
+  let d="";
+  for(const s of shape.segments||[]){
+    switch(s.cmd){
+      case "moveto": d+=`M ${s.x} ${s.y} `; break;
+      case "lineto": d+=`L ${s.x} ${s.y} `; break;
+      case "cubic": d+=`C ${s.x1} ${s.y1} ${s.x2} ${s.y2} ${s.x} ${s.y} `; break;
+      case "quad": d+=`Q ${s.x1} ${s.y1} ${s.x} ${s.y} `; break;
+      case "arc": {
+        const rx=Math.abs(s.rx), ry=Math.abs(s.ry);
+        const rot=s.phi||0;
+        d+=`A ${rx} ${ry} ${rot} ${s.large_arc?1:0} ${s.sweep?1:0} ${s.x} ${s.y} `;
+        break;
+      }
+      case "close": d+="Z "; break;
+    }
+  }
+  return d.trim();
+}
+function shapeElement(shape){
+  let n;
+  switch(shape.type){
+    case "rect": n=el("rect",{x:shape.x,y:shape.y,width:shape.w,height:shape.h}); if(shape.rx!==undefined)n.setAttribute("rx",shape.rx); if(shape.ry!==undefined)n.setAttribute("ry",shape.ry); break;
+    case "ellipse": n=el("ellipse",{cx:shape.cx,cy:shape.cy,rx:shape.rx,ry:shape.ry}); break;
+    case "line": n=el("line",{x1:shape.x1,y1:shape.y1,x2:shape.x2,y2:shape.y2}); break;
+    case "polygon": n=el("polygon",{points:(shape.points||[]).map(p=>p.join(",")).join(" ")}); break;
+    case "path": n=el("path",{d:pathData(shape)}); break;
+    default: return null;
+  }
+  const fill=shape.fill;
+  if(typeof fill==="string") n.setAttribute("fill",fill);
+  else if(fill&&fill._id) n.setAttribute("fill",`url(#${fill._id})`);
+  else n.setAttribute("fill","none");
+  const stroke=shape.stroke;
+  n.setAttribute("stroke",typeof stroke==="string"?stroke:"none");
+  if(shape.stroke_width!==undefined)n.setAttribute("stroke-width",shape.stroke_width);
+  if(shape.fill_opacity!==undefined)n.setAttribute("fill-opacity",shape.fill_opacity);
+  if(shape.stroke_opacity!==undefined)n.setAttribute("stroke-opacity",shape.stroke_opacity);
+  if(shape.clip&&shape.clip._id)n.setAttribute("clip-path",`url(#${shape.clip._id})`);
+  return n;
+}
+function buildGradient(fill,id){
+  let g;
+  if(fill.type==="linear_gradient"){
+    g=el("linearGradient",{id,x1:fill.x1,y1:fill.y1,x2:fill.x2,y2:fill.y2,gradientUnits:"userSpaceOnUse",spreadMethod:fill.spread||"pad"});
+  }else if(fill.type==="radial_gradient"){
+    g=el("radialGradient",{id,cx:fill.cx,cy:fill.cy,r:fill.r,fx:fill.fx,fy:fill.fy,gradientUnits:"userSpaceOnUse",spreadMethod:fill.spread||"pad"});
+  }else return null;
+  for(const stop of fill.stops||[])g.appendChild(el("stop",{offset:stop.offset,"stop-color":stop.color,"stop-opacity":stop.opacity??1}));
+  return g;
+}
+function makeClip(clip,id){
+  const cp=el("clipPath",{id,clipPathUnits:"userSpaceOnUse"});
+  for(const s of clip.shapes||[]){const n=shapeElement({...s,fill:"white",stroke:"none",stroke_width:0,fill_opacity:1,stroke_opacity:1});if(n)cp.appendChild(n);}
+  return cp;
+}
+function prepareShape(shape,index,defs){
+  let s=structuredClone(shape);
+  if(s.fill&&typeof s.fill==="object"){
+    const id=`g_${index}`; const g=buildGradient(s.fill,id); if(g)defs.appendChild(g); s.fill={_id:id};
+  }
+  if(s.clip){const cid=`c_${index}`; defs.appendChild(makeClip(s.clip,cid)); s.clip={_id:cid};}
+  return s;
+}
+function renderDocument(data){
+  doc=data; bounds=data.bounds; svg.replaceChildren();
+  const defs=el("defs"); svg.appendChild(defs);
+  const group=el("g"); svg.appendChild(group);
+  for(let i=0;i<(data.shapes||[]).length;i++){
+    const s=prepareShape(data.shapes[i],i,defs); const n=shapeElement(s); if(n)group.appendChild(n);
+  }
+  baseView={x:bounds.xmin,y:bounds.ymin,w:bounds.xmax-bounds.xmin,h:bounds.ymax-bounds.ymin};
+  view={...baseView}; applyView();
+  fileName.textContent=data.source||"JSON";
+  status.textContent=`${data.shapes?.length||0} shapes`;
+}
+function applyView(){svg.setAttribute("viewBox",`${view.x} ${view.y} ${view.w} ${view.h}`);}
+function fit(){if(baseView){view={...baseView};applyView();}}
+function one(){if(!baseView)return;const cw=svg.clientWidth,ch=svg.clientHeight;const scale=Math.min(cw/baseView.w,ch/baseView.h);const w=cw/scale,h=ch/scale;view={x:baseView.x+(baseView.w-w)/2,y:baseView.y+(baseView.h-h)/2,w,h};applyView();}
+fileInput.addEventListener("change",()=>{const f=fileInput.files[0];if(!f)return;const r=new FileReader();r.onload=()=>{try{renderDocument(JSON.parse(r.result));}catch(e){status.textContent="Invalid JSON";console.error(e);}};r.readAsText(f);});
+document.getElementById("fit").onclick=fit;
+document.getElementById("one").onclick=one;
+svg.addEventListener("wheel",e=>{e.preventDefault();if(!view)return;const r=svg.getBoundingClientRect();const mx=view.x+(e.clientX-r.left)/r.width*view.w;const my=view.y+(e.clientY-r.top)/r.height*view.h;const factor=e.deltaY<0?0.9:1.1;view.w*=factor;view.h*=factor;view.x=mx-(e.clientX-r.left)/r.width*view.w;view.y=my-(e.clientY-r.top)/r.height*view.h;applyView();},{passive:false});
+svg.addEventListener("mousedown",e=>{dragging=true;lastX=e.clientX;lastY=e.clientY;});
+window.addEventListener("mouseup",()=>dragging=false);
+window.addEventListener("mousemove",e=>{if(!dragging||!view)return;const r=svg.getBoundingClientRect();view.x-=(e.clientX-lastX)/r.width*view.w;view.y-=(e.clientY-lastY)/r.height*view.h;lastX=e.clientX;lastY=e.clientY;applyView();});
+fetch("Philips_PM5544.json",{cache:"no-store"}).then(r=>{if(!r.ok)throw new Error();return r.json();}).then(renderDocument).catch(()=>{fileName.textContent="Select Philips_PM5544.json";status.textContent="";});
+</script>
+</body>
+</html>
